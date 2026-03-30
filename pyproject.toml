@@ -19,5 +19,5 @@ authors = [
 airborne-sync = "airborne_sync.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 include = ["airborne_sync*"]

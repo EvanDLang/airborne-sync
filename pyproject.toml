@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airborne-sync"
+version = "0.1.0"
+description = "A CLI tool with a built in credentials manager for syncing files to Airborne SMCE S3 buckets using Keycloak authentication."
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.34",
+    "requests>=2.31",
+]
+authors = [
+    { name = "Evan Lang", email = "evan.d.lang@nasa.gov" }
+]
+
+[project.scripts]
+airborne-sync = "airborne_sync.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["airborne_sync*"]

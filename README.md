@@ -5,7 +5,7 @@ A command-line tool for uploading files to Airborne SMCE S3 buckets. Authenticat
 ## Installation
 
 ```bash
-pip install git+https://github.com/EvanDLang/airborne-sync.git@v0.1.0
+pip install git+https://github.com/EvanDLang/airborne-sync.git
 ```
 
 ## Authentication

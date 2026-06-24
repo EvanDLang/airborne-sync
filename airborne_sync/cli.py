@@ -67,14 +67,6 @@ Examples:
     # login / logout - handled before anything else
     # ------------------------------------------------------------------
     if args.command_or_source == "login":
-        cached = token_cache.load()
-        if cached is not None:
-            try:
-                load_session()
-                print("Already logged in. Run 'airborne-sync logout' to clear your session.")
-                return
-            except SystemExit:
-                pass  # session expired, fall through to re-authenticate
         token_response = device_flow()
         token_cache.save(token_response)
         print("Login successful. Session saved to ~/.airborne/token.json")

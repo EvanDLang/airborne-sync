@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "airborne-sync"
-version = "0.1.0"
-description = "A CLI tool with a built in credentials manager for syncing files to Airborne SMCE S3 buckets using Keycloak authentication."
+version = "0.2.0"
+description = "Keycloak-authenticated AWS credentials for Airborne SMCE S3 buckets, for use with the AWS CLI and other S3 tools."
 requires-python = ">=3.11"
 dependencies = [
-    "boto3>=1.34",
     "requests>=2.31",
 ]
 authors = [

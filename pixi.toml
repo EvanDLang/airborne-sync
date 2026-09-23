@@ -1,0 +1,13 @@
+[workspace]
+name = "airborne-sync"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.11"
+awscli = ">=2"
+s5cmd = ">=2.2"
+rclone = ">=1.66"
+
+[pypi-dependencies]
+airborne-sync = { path = ".", editable = true }

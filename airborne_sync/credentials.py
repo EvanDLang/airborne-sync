@@ -1,13 +1,10 @@
-"""STS credential management with automatic refresh via botocore RefreshableCredentials."""
+"""STS credential management via the Airborne SMCE credentials API."""
 
 import time
 import threading
 from datetime import datetime
 
-import boto3
-import botocore.session
 import requests
-from botocore.credentials import RefreshableCredentials
 
 from . import config
 from .auth import TokenManager
@@ -15,12 +12,8 @@ from .auth import TokenManager
 
 class CredentialManager:
     """
-    Fetches STS credentials from the Airborne SMCE credentials Lambda and
-    refreshes them automatically before they expire.
-
-    Uses botocore RefreshableCredentials so that every S3 API call
-    transparently gets fresh credentials without any manual intervention.
-    Thread-safe.
+    Fetches STS credentials from the Airborne SMCE credentials Lambda,
+    refetching them when they are close to expiry. Thread-safe.
     """
 
     def __init__(self, token_manager: TokenManager):
@@ -63,42 +56,19 @@ class CredentialManager:
                 self._fetch()
         return self._buckets
 
-    def get_credentials(self) -> dict:
+    def credential_process_output(self) -> dict:
         """
-        Return a botocore-compatible credentials dict, refreshing if needed.
+        Return credentials in the AWS credential_process JSON format.
 
-        This is passed as the refresh_using callable to RefreshableCredentials,
-        so botocore calls it automatically before every S3 request when
-        credentials are close to expiry.
+        See https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
         """
         with self._lock:
             if self._creds is None or time.time() >= self._expires_at:
                 self._fetch()
             return {
-                "access_key":  self._creds["accessKeyId"],
-                "secret_key":  self._creds["secretAccessKey"],
-                "token":       self._creds["sessionToken"],
-                "expiry_time": self._creds["expiration"],
+                "Version":         1,
+                "AccessKeyId":     self._creds["accessKeyId"],
+                "SecretAccessKey": self._creds["secretAccessKey"],
+                "SessionToken":    self._creds["sessionToken"],
+                "Expiration":      self._creds["expiration"],
             }
-
-    def build_s3_client(self):
-        """
-        Build a boto3 S3 client backed by RefreshableCredentials.
-
-        The client will automatically refresh STS credentials (by calling
-        get_credentials) before they expire, with no upload interruption.
-        """
-        refreshable = RefreshableCredentials.create_from_metadata(
-            metadata=self.get_credentials(),
-            refresh_using=self.get_credentials,
-            method="custom-refresh",
-        )
-
-        botocore_sess = botocore.session.get_session()
-        botocore_sess._credentials = refreshable
-
-        session = boto3.Session(
-            botocore_session=botocore_sess,
-            region_name=config.AWS_REGION,
-        )
-        return session.client("s3")

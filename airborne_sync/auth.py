@@ -101,18 +101,25 @@ class TokenManager:
         self._lock = threading.Lock()
         self._access_token: str  = token_response["access_token"]
         self._refresh_token: str = token_response["refresh_token"]
-        self._access_expires_at: float  = time.monotonic() + token_response.get("expires_in", 300) - 30
-        self._refresh_expires_at: float = time.monotonic() + token_response.get("refresh_expires_in", 1800) - 30
+        # Expiry is tracked in wall-clock time so it stays valid across processes
+        # via the token cache. Responses without saved_at are fresh from Keycloak.
+        issued_at = token_response.get("saved_at", time.time())
+        self._access_expires_at: float  = issued_at + token_response.get("expires_in", 300) - 30
+        self._refresh_expires_at: float = issued_at + token_response.get("refresh_expires_in", 1800) - 30
+        if time.time() >= self._refresh_expires_at:
+            raise SessionExpiredError(
+                "Session expired. Run 'airborne-sync login' to authenticate."
+            )
 
     @property
     def access_token(self) -> str:
         with self._lock:
-            if time.monotonic() >= self._access_expires_at:
+            if time.time() >= self._access_expires_at:
                 self._refresh()
             return self._access_token
 
     def _refresh(self) -> None:
-        if time.monotonic() >= self._refresh_expires_at:
+        if time.time() >= self._refresh_expires_at:
             raise SessionExpiredError(
                 "Session expired. Run 'airborne-sync login' to authenticate."
             )
@@ -129,21 +136,23 @@ class TokenManager:
             },
             timeout=10,
         )
+        if resp.status_code == 400:
+            # invalid_grant: SSO session idle/max reached or session revoked
+            raise SessionExpiredError(
+                "Session expired. Run 'airborne-sync login' to authenticate."
+            )
         resp.raise_for_status()
         body = resp.json()
+        now = time.time()
         self._access_token      = body["access_token"]
         self._refresh_token     = body.get("refresh_token", self._refresh_token)
-        self._access_expires_at = time.monotonic() + body.get("expires_in", 300) - 30
-        self._refresh_expires_at = (
-            time.monotonic()
-            + body.get("refresh_expires_in", self._refresh_expires_at - time.monotonic())
-            - 30
-        )
+        self._access_expires_at = now + body.get("expires_in", 300) - 30
+        refresh_expires_in = body.get("refresh_expires_in", self._refresh_expires_at - now + 30)
+        self._refresh_expires_at = now + refresh_expires_in - 30
         # Persist refreshed token back to cache
         token_cache.save({
-            "access_token":      self._access_token,
-            "refresh_token":     self._refresh_token,
-            "expires_in":        body.get("expires_in", 300),
-            "refresh_expires_in": body.get("refresh_expires_in", 1800),
+            "access_token":       self._access_token,
+            "refresh_token":      self._refresh_token,
+            "expires_in":         body.get("expires_in", 300),
+            "refresh_expires_in": refresh_expires_in,
         })
-

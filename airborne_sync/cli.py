@@ -1,141 +1,136 @@
 """CLI entry point for airborne-sync."""
 
 import argparse
+import configparser
+import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
 from .auth import device_flow, load_session, SessionExpiredError
 from .credentials import CredentialManager
-from .transfer import (
-    upload_file,
-    sync_local_to_s3,
-    list_objects,
-    parse_s3_uri,
-    _fmt_bytes,
-)
 from . import config
 from . import token_cache
+
+
+def _aws_config_path() -> Path:
+    return Path(os.environ.get("AWS_CONFIG_FILE", Path.home() / ".aws" / "config")).expanduser()
+
+
+def _credential_process_command() -> str:
+    """Command line the AWS CLI should run to fetch credentials."""
+    exe = shutil.which("airborne-sync")
+    parts = [exe] if exe else [sys.executable, "-m", "airborne_sync.cli"]
+    parts.append("credential-process")
+    return " ".join(f'"{p}"' if " " in p else p for p in parts)
+
+
+def _cmd_credential_process(args) -> None:
+    # stdout must contain only the credentials JSON; errors go to stderr.
+    try:
+        cred_manager = CredentialManager(load_session())
+        output = cred_manager.credential_process_output()
+    except SessionExpiredError as e:
+        sys.exit(str(e))
+    except Exception as e:
+        sys.exit(f"airborne-sync: failed to fetch credentials: {e}")
+    json.dump(output, sys.stdout)
+
+
+def _cmd_setup_profile(args) -> None:
+    path = _aws_config_path()
+    section = "default" if args.profile == "default" else f"profile {args.profile}"
+    command = _credential_process_command()
+
+    parser = configparser.RawConfigParser()
+    if path.exists():
+        parser.read(path)
+    if parser.has_section(section):
+        sys.exit(
+            f"Profile '{args.profile}' already exists in {path}. Edit it manually so it contains:\n\n"
+            f"  [{section}]\n"
+            f"  region = {config.AWS_REGION}\n"
+            f"  credential_process = {command}\n"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else ""
+    separator = "" if not existing or existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
+    with open(path, "a") as f:
+        f.write(
+            f"{separator}[{section}]\n"
+            f"region = {config.AWS_REGION}\n"
+            f"credential_process = {command}\n"
+        )
+    print(f"Added profile '{args.profile}' to {path}")
+    print(f"\nTry it:  aws s3 ls --profile {args.profile}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="airborne-sync",
-        description="Upload files to Airborne SMCE S3 buckets.",
+        description="Keycloak-authenticated AWS credentials for Airborne SMCE S3 buckets.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   airborne-sync login
+  airborne-sync setup-profile
+  airborne-sync list-buckets
+  aws s3 sync ./data s3://airborne-smce-prod-user-bucket/mydata --profile airborne
   airborne-sync logout
-  airborne-sync --list-buckets
-  airborne-sync --list s3://airborne-smce-prod-user-bucket/mydata/
-  airborne-sync ./data/flight.nc s3://airborne-smce-prod-user-bucket/mydata/flight.nc
-  airborne-sync ./data s3://airborne-smce-prod-user-bucket/mydata
-  airborne-sync ./data s3://airborne-smce-prod-user-bucket/mydata --delete
-  airborne-sync ./data s3://airborne-smce-prod-user-bucket/mydata --dry-run
         """,
     )
-    parser.add_argument("command_or_source", nargs="?", help="'login', 'logout', or local source path")
-    parser.add_argument("dest",              nargs="?", help="Destination S3 URI (s3://bucket/prefix)")
-    parser.add_argument("--delete",       action="store_true", help="Delete files in S3 not present locally")
-    parser.add_argument("--dry-run",      action="store_true", help="Show what would be uploaded without transferring")
-    parser.add_argument("--list-buckets", action="store_true", help="List buckets you have access to and exit")
-    parser.add_argument("--list",         metavar="S3_URI",    help="List objects at s3://bucket/prefix and exit")
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=config.MAX_CONCURRENCY,
-        metavar="N",
-        help=f"Parallel part uploads per file (default: {config.MAX_CONCURRENCY})",
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    sub.add_parser("login", help="Log in via Keycloak and cache the session")
+    sub.add_parser("logout", help="Delete the cached session")
+    sub.add_parser("list-buckets", help="List buckets you have access to")
+    sub.add_parser(
+        "credential-process",
+        help="Print temporary AWS credentials as JSON (used by the AWS credential_process setting)",
     )
-    parser.add_argument(
-        "--file-concurrency",
-        type=int,
-        default=config.MAX_FILE_CONCURRENCY,
-        metavar="N",
-        help=f"Parallel files during directory sync (default: {config.MAX_FILE_CONCURRENCY})",
+    setup = sub.add_parser("setup-profile", help="Add an AWS CLI profile that uses airborne-sync credentials")
+    setup.add_argument(
+        "--profile",
+        default=config.AWS_PROFILE,
+        help=f"AWS profile name to create (default: {config.AWS_PROFILE})",
     )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=config.MULTIPART_CHUNKSIZE // (1024 * 1024),
-        metavar="MB",
-        help=f"Multipart chunk size in MB (default: {config.MULTIPART_CHUNKSIZE // (1024 * 1024)})",
-    )
+
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # login / logout - handled before anything else
-    # ------------------------------------------------------------------
-    if args.command_or_source == "login":
+    if args.command == "login":
         token_response = device_flow()
         token_cache.save(token_response)
         print("Login successful. Session saved to ~/.airborne/token.json")
         return
 
-    if args.command_or_source == "logout":
+    if args.command == "logout":
         token_cache.delete()
         print("Logged out.")
         return
 
-    # ------------------------------------------------------------------
-    # All other commands require a valid cached session
-    # ------------------------------------------------------------------
-    if not args.list_buckets and not args.list and (not args.command_or_source or not args.dest):
-        parser.print_help()
-        sys.exit(1)
+    if args.command == "credential-process":
+        _cmd_credential_process(args)
+        return
 
-    # Apply CLI overrides to config
-    config.MAX_CONCURRENCY      = args.concurrency
-    config.MAX_FILE_CONCURRENCY = args.file_concurrency
-    config.MULTIPART_CHUNKSIZE  = args.chunk_size * 1024 * 1024
+    if args.command == "setup-profile":
+        _cmd_setup_profile(args)
+        return
 
-    try:
-        token_manager = load_session()
-    except SessionExpiredError:
-        sys.exit("Session expired. Run 'airborne-sync login' to authenticate.")
-
-    cred_manager = CredentialManager(token_manager)
-
-    if args.list_buckets:
+    if args.command == "list-buckets":
+        try:
+            cred_manager = CredentialManager(load_session())
+            buckets = cred_manager.buckets
+        except SessionExpiredError as e:
+            sys.exit(str(e))
         print("\nBuckets you have access to:")
-        for b in cred_manager.buckets:
+        for b in buckets:
             print(f"  s3://{b}")
         return
 
-    if args.list:
-        bucket, prefix = parse_s3_uri(args.list)
-        s3 = cred_manager.build_s3_client()
-        list_objects(s3, bucket, prefix)
-        return
-
-    # Enforce upload-only
-    if args.command_or_source and args.command_or_source.startswith("s3://"):
-        sys.exit("Error: downloads are not supported. Source must be a local path.")
-
-    if not args.dest.startswith("s3://"):
-        sys.exit("Error: destination must be an S3 URI (s3://bucket/prefix).")
-
-    s3 = cred_manager.build_s3_client()
-
-    local_path = Path(args.command_or_source)
-    if not local_path.exists():
-        sys.exit(f"Error: source path does not exist: {local_path}")
-
-    bucket, key_or_prefix = parse_s3_uri(args.dest)
-
-    if local_path.is_file():
-        config.MAX_FILE_CONCURRENCY = 1
-        if key_or_prefix.endswith("/") or "." not in Path(key_or_prefix).name:
-            key = key_or_prefix.rstrip("/") + "/" + local_path.name
-        else:
-            key = key_or_prefix
-        size = local_path.stat().st_size
-        print(f"\n  Uploading {local_path.name} → s3://{bucket}/{key} ({_fmt_bytes(size)})\n")
-        upload_file(s3, local_path, bucket, key, size)
-    else:
-        sync_local_to_s3(s3, local_path, bucket, key_or_prefix, args.delete, args.dry_run)
-
-    print("\nSync complete.")
+    parser.print_help()
+    sys.exit(1)
 
 
 if __name__ == "__main__":

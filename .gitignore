@@ -3,8 +3,7 @@ gen_netcdf.py
 node_modules/
 .terraform*
 old/
-pixi*
-.pixi*
+.pixi/
 *.nc
 airborne_sync.egg*
 __pycache__
@@ -46,3 +45,5 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+# benchmark output
+bench/results-*.csv

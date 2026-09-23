@@ -1,5 +1,5 @@
 """
-Configuration for the Airborne SMCE S3 sync tool.
+Configuration for the Airborne SMCE S3 credentials helper.
 
 All values can be overridden by environment variables with the same name,
 prefixed with AIRBORNE_. For example:
@@ -24,17 +24,10 @@ CREDENTIALS_API   = os.environ.get("AIRBORNE_CREDENTIALS_API",   "https://upload
 # AWS
 # ---------------------------------------------------------------------------
 AWS_REGION        = os.environ.get("AIRBORNE_AWS_REGION",        "us-west-2")
+AWS_PROFILE       = os.environ.get("AIRBORNE_AWS_PROFILE",       "airborne")
 
 # ---------------------------------------------------------------------------
 # Credential refresh buffer
 # Fetch new STS credentials when this many seconds remain before expiry
 # ---------------------------------------------------------------------------
 CRED_REFRESH_BUFFER_SECS = int(os.environ.get("AIRBORNE_CRED_REFRESH_BUFFER_SECS", 5 * 60))
-
-# ---------------------------------------------------------------------------
-# Transfer tuning
-# ---------------------------------------------------------------------------
-MULTIPART_THRESHOLD  = int(os.environ.get("AIRBORNE_MULTIPART_THRESHOLD",  100 * 1024 * 1024))  # 100 MB
-MULTIPART_CHUNKSIZE  = int(os.environ.get("AIRBORNE_MULTIPART_CHUNKSIZE",  100 * 1024 * 1024))  # 100 MB parts
-MAX_CONCURRENCY      = int(os.environ.get("AIRBORNE_MAX_CONCURRENCY",      8))   # parallel parts per file
-MAX_FILE_CONCURRENCY = int(os.environ.get("AIRBORNE_MAX_FILE_CONCURRENCY", 4))   # parallel files in directory sync

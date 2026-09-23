@@ -1,12 +1,48 @@
 # airborne-sync
 
-A command-line tool for uploading files to Airborne SMCE S3 buckets. Authenticates via Keycloak using a browser-based device flow. Credentials are automatically refreshed throughout the upload when using tools such as boto3 and s3fs, AWS CLI uploads can be done in 10 hour blocks. **Currently only uploading data is supported. Syncing data to a local machine from S3 is not yet supported due the potential for high inter-regional data transfer costs. If you need to extract large amounts of data from a supported bucket, please contact admin.**
+Keycloak-authenticated access to Airborne SMCE S3 buckets for people who do not have their own AWS credentials. You log in with your Keycloak account, and `airborne-sync` supplies short-lived AWS credentials to standard S3 tools, which do the actual transfer: the [AWS CLI](https://aws.amazon.com/cli/), [s5cmd](https://github.com/peak/s5cmd) and [rclone](https://rclone.org/). All of them are installed together in a [pixi](https://pixi.sh) environment. Credentials are refreshed automatically for the length of your Keycloak session (up to 10 hours).
+
+**Downloading large amounts of data from these buckets can incur high inter-regional data transfer costs. If you need to extract large amounts of data from a supported bucket, please contact admin.**
 
 ## Installation
 
+1. Install [pixi](https://pixi.sh/latest/#installation) if you don't have it:
+
+   ```bash
+   curl -fsSL https://pixi.sh/install.sh | bash
+   ```
+
+   On Windows (PowerShell): `powershell -ExecutionPolicy ByPass -c "irm -useb https://pixi.sh/install.ps1 | iex"`
+
+2. Clone the repository and install the environment:
+
+   ```bash
+   git clone https://github.com/EvanDLang/airborne-sync.git
+   cd airborne-sync
+   pixi install
+   ```
+
+   This installs `airborne-sync`, the AWS CLI v2, s5cmd and rclone into `.pixi/` inside the repository. Nothing is installed system-wide, and you do not need an AWS account or to run `aws configure`.
+
+3. Activate the environment in your shell:
+
+   ```bash
+   pixi shell
+   ```
+
+   All commands below assume an activated environment. Alternatively, prefix a single command with `pixi run`, for example `pixi run airborne-sync login`.
+
+## Quick start
+
 ```bash
-pip install git+https://github.com/EvanDLang/airborne-sync.git
+airborne-sync login            # log in with Keycloak (once per session)
+airborne-sync setup-profile    # one time: adds an "airborne" profile to ~/.aws/config
+airborne-sync list-buckets     # see which buckets you can use
+
+aws s3 sync ./data s3://airborne-smce-prod-user-bucket/mydata --profile airborne
 ```
+
+`setup-profile` records the full path to `airborne-sync` inside the pixi environment, so the profile keeps working in shells where the environment is not activated. If you move or delete the repository, run `setup-profile` again (after removing the old `[profile airborne]` section).
 
 ## Authentication
 
@@ -44,7 +80,9 @@ Deletes the cached session file.
 
 ### Session lifetime
 
-Sessions last up to **10 hours**. The access token (5 min) is silently refreshed in the background - you will never be prompted to re-authenticate mid-upload. After 10 hours the session expires and you need to run `airborne-sync login` again.
+Sessions last up to **10 hours**. The access token (5 min) is silently refreshed in the background, so you are not prompted to re-authenticate mid-upload. After 10 hours the session expires and you need to run `airborne-sync login` again.
+
+If a long `aws s3 sync` is interrupted by session expiry, log in again and re-run the same command: files that were already uploaded are skipped.
 
 If a command is run without a valid session:
 
@@ -58,35 +96,54 @@ If the session has expired:
 Session expired. Run 'airborne-sync login' to authenticate.
 ```
 
+## Setting up the AWS profile
+
+```bash
+airborne-sync setup-profile
+```
+
+This appends the following to `~/.aws/config` (or `$AWS_CONFIG_FILE`):
+
+```ini
+[profile airborne]
+region = us-west-2
+credential_process = /path/to/airborne-sync/.pixi/envs/default/bin/airborne-sync credential-process
+```
+
+[`credential_process`](https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html) tells the AWS CLI, s5cmd and rclone to run `airborne-sync credential-process` whenever they need credentials. That command uses your cached Keycloak session to fetch temporary AWS credentials and prints them as JSON. You never need to run it yourself.
+
+Use `--profile NAME` to pick a different profile name. If the profile already exists, the command does not modify your config; it prints what the section should contain so you can edit it manually.
+
+Instead of passing `--profile airborne` to every command, you can set it for your shell:
+
+```bash
+export AWS_PROFILE=airborne
+```
+
 ## How credentials work
 
 There are two credential layers, both managed automatically:
 
-**Keycloak tokens** — your access token is valid for 5 minutes. The tool holds a refresh token and silently renews the access token before it expires. This continues for up to 10 hours (the SSO session maximum), after which you need to run `airborne-sync login` again.
+**Keycloak tokens**: your access token is valid for 5 minutes. `airborne-sync` holds a refresh token and silently renews the access token when needed. This continues for up to 10 hours (the SSO session maximum), after which you need to run `airborne-sync login` again.
 
-**AWS STS credentials** — on each command the tool calls the Airborne SMCE credentials API with your Keycloak token to obtain short-lived AWS STS credentials (1 hour TTL). These are scoped by a session policy built from your Keycloak group memberships - you can only access the S3 buckets your groups permit, regardless of what path you provide.
+**AWS STS credentials**: when an AWS tool needs credentials, `airborne-sync credential-process` calls the Airborne SMCE credentials API with your Keycloak token to obtain short-lived AWS STS credentials (1 hour TTL). These are scoped by a session policy built from your Keycloak group memberships: you can only access the S3 buckets your groups permit, regardless of what path you provide.
 
-**Automatic refresh during uploads** — the tool uses `botocore.RefreshableCredentials`, which checks expiry before every S3 API call. When credentials are within 5 minutes of expiring it transparently fetches a new set before the request proceeds. For multipart uploads this check happens before every individual part, so a 10 hour upload of a large dataset will never fail mid-transfer.
-
-The full refresh chain on every S3 request:
+**Automatic refresh during transfers**: the AWS CLI, s5cmd and rclone track the credential expiry and run `credential_process` again before it is reached, so long transfers continue without interruption:
 
 ```
-S3 part upload
-  → botocore checks STS credential expiry
-    → if expiring: fetch new credentials
-      → check Keycloak token expiry
-        → if expiring: refresh via refresh_token grant
-      → POST /s3-credentials with fresh Keycloak token
-        → Lambda builds session policy from your Keycloak groups
-        → STS issues new 1-hour credentials
-  → proceed with upload
+aws s3 sync (credentials close to expiry)
+  → runs airborne-sync credential-process
+    → check Keycloak token expiry
+      → if expiring: refresh via refresh_token grant
+    → POST /s3-credentials with fresh Keycloak token
+      → Lambda builds session policy from your Keycloak groups
+      → STS issues new 1-hour credentials
+  → transfer continues
 ```
 
 ## Access control
 
 Access is determined entirely by your Keycloak group memberships. The credentials Lambda translates your groups into an AWS session policy at credential-fetch time. Users with no group memberships can only access the base shared buckets. You cannot access buckets outside your policy regardless of what S3 URI you provide.
-
-Downloads are not supported by this tool to avoid egress costs.
 
 ---
 
@@ -95,99 +152,119 @@ Downloads are not supported by this tool to avoid egress costs.
 ### List your accessible buckets
 
 ```bash
-airborne-sync --list-buckets
+airborne-sync list-buckets
 ```
 
 ### List objects at a prefix
 
 ```bash
-airborne-sync --list s3://airborne-smce-prod-user-bucket/mydata/
-```
-
-Output:
-
-```
-  Key                                                          Size  Last Modified
-  ------------------------------------------------------------ ----  --------------------
-  mydata/flight_20240301.nc                                  8.2 GB  2024-03-01 14:22:01
-  mydata/flight_20240302.nc                                  7.9 GB  2024-03-02 09:11:44
-
-  2 object(s)
+aws s3 ls s3://airborne-smce-prod-user-bucket/mydata/ --profile airborne
 ```
 
 ### Upload a single file
 
 ```bash
-airborne-sync ./data/flight_20240301.nc s3://airborne-smce-prod-user-bucket/mydata/flight_20240301.nc
-```
-
-If the destination ends with `/` or has no file extension, the filename is appended automatically:
-
-```bash
-airborne-sync ./data/flight_20240301.nc s3://airborne-smce-prod-user-bucket/mydata/
-# uploads to s3://airborne-smce-prod-user-bucket/mydata/flight_20240301.nc
+aws s3 cp ./data/flight_20240301.nc s3://airborne-smce-prod-user-bucket/mydata/ --profile airborne
 ```
 
 ### Upload a directory
 
 ```bash
-airborne-sync ./data s3://airborne-smce-prod-user-bucket/mydata
+aws s3 sync ./data s3://airborne-smce-prod-user-bucket/mydata --profile airborne
 ```
 
-Only files that are missing or different on S3 are uploaded - files already present with matching content are skipped. Re-running the same command is safe and efficient.
+Only files that are missing on S3, or whose size or modification time differ, are uploaded. Re-running the same command is safe and efficient.
 
-To also delete files on S3 that no longer exist locally:
-
-```bash
-airborne-sync ./data s3://airborne-smce-prod-user-bucket/mydata --delete
-```
-
-### Preview without uploading
+Useful options (see `aws s3 sync help` for all of them):
 
 ```bash
-airborne-sync ./data s3://airborne-smce-prod-user-bucket/mydata --dry-run
+--dryrun                 # show what would be uploaded without transferring
+--delete                 # delete files on S3 that no longer exist locally
+--exclude "*.tmp"        # skip matching files
+--exclude "*" --include "*.nc"   # only upload matching files
 ```
 
 ---
 
-## Performance tuning
+## Performance tuning for large uploads
 
-Three flags control upload parallelism:
+### AWS CLI
 
-| Flag | Default | Description |
+The AWS CLI's transfer settings live in the profile. For multi-terabyte uploads on a fast connection, add an `s3` block to the `airborne` profile in `~/.aws/config`:
+
+```ini
+[profile airborne]
+region = us-west-2
+credential_process = /path/to/airborne-sync/.pixi/envs/default/bin/airborne-sync credential-process
+s3 =
+  max_concurrent_requests = 32
+  multipart_chunksize = 64MB
+```
+
+| Setting | AWS CLI default | Description |
 |---|---|---|
-| `--concurrency N` | `4` | Parallel part uploads per file |
-| `--file-concurrency N` | `2` | Parallel files during directory sync |
-| `--chunk-size MB` | `100` | Size of each multipart part |
+| `max_concurrent_requests` | `10` | Parallel requests across all files and parts |
+| `multipart_chunksize` | `8MB` | Part size for multipart uploads (raised automatically for very large files) |
+| `multipart_threshold` | `8MB` | Files larger than this are uploaded in parallel parts |
 
-**These multiply.** Total concurrent S3 connections = `--concurrency × --file-concurrency`. Peak RAM usage = `--concurrency × --file-concurrency × --chunk-size`.
+Peak memory is roughly `max_concurrent_requests × multipart_chunksize`. Increasing concurrency stops helping once your network connection is saturated. See the [AWS CLI S3 configuration docs](https://docs.aws.amazon.com/cli/latest/topic/s3-config.html) for more settings.
 
-With the defaults:
+## Using s5cmd
 
-```
-4 parts × 2 files × 100 MB = 800 MB peak RAM, 8 concurrent S3 connections
-```
+[s5cmd](https://github.com/peak/s5cmd) is a high-performance S3 client that is usually much faster than the AWS CLI, particularly for directories containing many files.
 
-For a single file upload `--file-concurrency` has no effect - only `--concurrency` matters:
-
-```
-4 parts × 100 MB = 400 MB peak RAM
-```
-
-**Recommended settings by scenario:**
+s5cmd's `--profile` flag only reads `~/.aws/credentials` and ignores `credential_process`. Select the profile with environment variables instead:
 
 ```bash
-# default - safe for any machine, good for most connections
-airborne-sync ./data s3://bucket/prefix
-
-# fast connection (>500 Mbps), workstation with 16 GB+ RAM
-airborne-sync ./data s3://bucket/prefix --concurrency 8 --file-concurrency 4
-# → 8 × 4 × 100 MB = 3.2 GB peak RAM, 32 connections
-
-# server or HPC node, 10 Gbps network
-airborne-sync ./data s3://bucket/prefix --concurrency 16 --file-concurrency 4
-# → 16 × 4 × 100 MB = 6.4 GB peak RAM, 64 connections
+export AWS_PROFILE=airborne
+export AWS_SDK_LOAD_CONFIG=1
 ```
 
-**Increasing concurrency stops helping once your network pipe is saturated.** Watch the speed output - if you are already hitting your connection's limit, adding more threads adds memory pressure with no throughput gain. If you exceed available RAM the OS will start swapping and performance will collapse.
+Then:
 
+```bash
+# upload a directory (the trailing slash on the source means "the contents of")
+s5cmd sync ./data/ s3://airborne-smce-prod-user-bucket/mydata/
+
+# upload a single file
+s5cmd cp ./data/flight_20240301.nc s3://airborne-smce-prod-user-bucket/mydata/
+
+# list objects
+s5cmd ls s3://airborne-smce-prod-user-bucket/mydata/
+```
+
+Useful options:
+
+```bash
+s5cmd --dry-run sync ...                 # show what would be uploaded
+s5cmd sync --delete ...                  # delete files on S3 that no longer exist locally
+s5cmd sync --size-only ...               # compare by size only
+s5cmd --numworkers 64 sync ...           # parallel files (default 256)
+s5cmd cp --concurrency 16 --part-size 64 ...   # parts per file (default 5) and part size in MB (default 50)
+```
+
+Always try a new `sync` command with `--dry-run` first.
+
+Unlike the AWS CLI, s5cmd requires a trailing `/` on an S3 destination that is a prefix: `s3://bucket/mydata/` works, while `s3://bucket/mydata` fails with `target ... must be a bucket or a prefix`. Global options such as `--dry-run` and `--numworkers` go **before** the command (`s5cmd --dry-run sync ...`), not after it.
+
+## Using rclone
+
+[rclone](https://rclone.org/) can use the same profile. Create a remote once:
+
+```bash
+rclone config create airborne s3 provider=AWS env_auth=true profile=airborne region=us-west-2
+```
+
+Then refer to buckets as `airborne:bucket/prefix`:
+
+```bash
+# upload new and changed files (never deletes anything on S3)
+rclone copy ./data airborne:airborne-smce-prod-user-bucket/mydata -P
+
+# list objects
+rclone ls airborne:airborne-smce-prod-user-bucket/mydata
+```
+
+**Note:** `rclone sync` makes the destination an exact mirror of the source, which **deletes** files on S3 that are not present locally. It behaves like `aws s3 sync --delete`. Use `rclone copy` unless you want that.
+
+Useful options: `--dry-run`, `-P` (progress), `--transfers 16` (parallel files, default 4), `--s3-upload-concurrency 8` (parts per file, default 4), `--s3-chunk-size 64M` (part size, default 5M).
